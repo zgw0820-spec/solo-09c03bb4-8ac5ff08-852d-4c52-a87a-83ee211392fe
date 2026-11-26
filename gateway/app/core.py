@@ -3,10 +3,19 @@
 管理 API（app.main）与看门狗（app.watchdog）是两个相互独立的进程，
 都通过本模块操作同一份状态文件。这样即使管理 API 进程停止，
 看门狗仍能在试切到期时自行回退路由。
+
+空闲行为（见 README「空闲 I/O 与唤醒机制」）：
+  - StateStore.locked() 只在状态内容真正变化时写盘并触发 on_change；
+  - StateStore.read() 是共享锁只读事务，绝不写盘、不发通知；
+  - API 在提交变更后通过 notify_watchdog() 往 FIFO 写一个字节唤醒看门狗，
+    查询路径不写盘也不通知；
+  - 看门狗平时阻塞在 select() 上，等待「FIFO 可读」或「当前试切到期」。
 """
 from __future__ import annotations
 
 import contextlib
+import copy
+import errno
 import fcntl
 import json
 import os
@@ -17,7 +26,21 @@ from datetime import datetime, timezone
 STATE_DIR = os.environ.get("TSW_STATE_DIR", "/state")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOCK_FILE = os.path.join(STATE_DIR, "state.lock")
+# API -> 看门狗的跨进程唤醒通道（FIFO）。看门狗以 O_RDWR 常驻打开，
+# API 每次「提交了状态变更」后非阻塞写一个字节；通知可合并、可丢失，
+# 因为看门狗唤醒后总是重新加锁读全量状态并按其中的 deadline 等待。
+NOTIFY_FIFO = os.environ.get("TSW_NOTIFY_FIFO",
+                             os.path.join(STATE_DIR, "watchdog.notify"))
 CONFIG_FILE = os.environ.get("TSW_CONFIG", "/app/config.yaml")
+
+# TSW_IO_DEBUG=1 时打印每一次状态文件读/写与看门狗通知，
+# 便于演示时核对「空闲期间看门狗不读不写、查询不回写不唤醒」。
+IO_DEBUG = os.environ.get("TSW_IO_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def io_trace(message: str) -> None:
+    if IO_DEBUG:
+        print(f"[io pid={os.getpid()}] {message}", flush=True)
 
 ACTIVE_STATUSES = ("trialing", "probing")      # 进行中的试切（占用试切槽位）
 TERMINAL_STATUSES = ("kept", "rolled_back")    # 终态
@@ -67,28 +90,72 @@ class Config:
 
 
 class StateStore:
-    """JSON 状态文件 + flock 互斥，供 API 与看门狗两个进程安全读写。"""
+    """JSON 状态文件 + flock 互斥，供 API 与看门狗两个进程安全读写。
 
-    def __init__(self, path: str = STATE_FILE):
+    - locked()：排他事务，退出时仅当状态内容发生变化才原子写盘，
+      并在锁释放后调用 on_change（API 进程用它唤醒看门狗）。
+      状态没变（例如一次普通查询顺带做的过期检查）时不写盘、不通知。
+    - read()：共享锁只读事务，绝不写盘/通知，供查询接口使用。
+    """
+
+    def __init__(self, path: str = STATE_FILE, on_change=None, *,
+                 lock_path: str | None = None):
         self.path = path
+        # 默认构造（两个进程都用 STATE_FILE）沿用全局 LOCK_FILE；
+        # 自定义 path（单元测试/多实例）且未显式给 lock_path 时，
+        # 锁文件贴在状态文件旁边，保持自洽。
+        self.lock_path = lock_path or (
+            LOCK_FILE if os.path.abspath(path) == os.path.abspath(STATE_FILE)
+            else path + ".lock"
+        )
+        self.on_change = on_change
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         if not os.path.exists(self.path):
             self._write({"current": None, "history": []})
 
     @contextlib.contextmanager
     def locked(self):
-        """read-modify-write 临界区。正常退出时落盘；抛异常则丢弃改动。"""
-        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-        with open(LOCK_FILE, "w", encoding="utf-8") as lock:
+        """read-modify-write 临界区。
+
+        正常退出且状态有变化时才落盘，并在释放锁后触发 on_change；
+        状态未变化则完全不写。抛异常时丢弃改动、不写盘、不通知。
+        """
+        changed = False
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        with open(self.lock_path, "w", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            state = self._read()
+            before = copy.deepcopy(state)
             try:
-                state = self._read()
                 yield state
-                self._write(state)
+            except Exception:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                raise
+            else:
+                if state != before:
+                    self._write(state)
+                    changed = True
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        if changed and self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception as exc:  # noqa: BLE001 - 通知失败不能影响主流程
+                io_trace(f"on_change callback failed: "
+                         f"{type(exc).__name__}: {exc}")
+
+    @contextlib.contextmanager
+    def read(self):
+        """共享锁只读临界区：只读取状态，退出时不写盘、不触发通知。"""
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        with open(self.lock_path, "w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            try:
+                yield self._read()
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _read(self) -> dict:
+        io_trace(f"state read  -> {self.path}")
         try:
             with open(self.path, encoding="utf-8") as f:
                 return json.load(f)
@@ -96,10 +163,85 @@ class StateStore:
             return {"current": None, "history": []}
 
     def _write(self, state: dict) -> None:
+        io_trace(f"state write -> {self.path}")
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)  # 原子替换，避免看门狗读到半写文件
+            f.flush()
+            os.fsync(f.fileno())       # 「刚落盘」：返回前数据已下推
+        os.replace(tmp, self.path)     # 原子替换，避免看门狗读到半写文件
+        try:
+            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)          # 让 rename 本身也持久（崩溃安全）
+            finally:
+                os.close(dfd)
+        except OSError:
+            # 某些文件系统不支持目录 fsync；不影响进程退出场景下的落盘语义
+            pass
+
+
+def ensure_notify_fifo(path: str = NOTIFY_FIFO) -> str:
+    """创建 API->看门狗的唤醒 FIFO（已存在且确为 FIFO 则复用）。
+
+    若同路径被普通文件等非 FIFO 对象占用（异常残留），替换成 FIFO，
+    避免看门狗 select 普通文件永远可读而陷入忙等。
+    """
+    import stat
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        st = os.stat(path)
+        if not stat.S_ISFIFO(st.st_mode):
+            os.unlink(path)
+            raise FileNotFoundError  # 落到下面统一 mkfifo
+    except FileNotFoundError:
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            pass
+    return path
+
+
+def notify_watchdog(path: str = NOTIFY_FIFO) -> bool:
+    """状态已变更后唤醒看门狗。
+
+    非阻塞：看门狗不在（FIFO 没有读端，ENXIO）或通知管道写满时直接放弃——
+    通知只是「提示有变化」，看门狗启动/唤醒后都会全量重读状态，
+    因此通知本身不需要可靠送达。返回是否成功写入了唤醒字节。
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        io_trace("notify skipped: fifo missing (watchdog not started?)")
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            io_trace("notify skipped: no fifo reader (watchdog down?)")
+            return False
+        io_trace(f"notify open failed: {type(exc).__name__}: {exc}")
+        return False
+    try:
+        os.write(fd, b"\x01")
+        io_trace("notify sent to watchdog")
+    except OSError as exc:  # 管道满/EAGAIN：已有待处理通知，合并即可
+        io_trace(f"notify coalesced/dropped: {type(exc).__name__}: {exc}")
+    finally:
+        os.close(fd)
+    return True
+
+
+def drain_notify_fifo(fd: int) -> None:
+    """读空 FIFO 中积压的唤醒字节（通知可合并，字节内容无意义）。"""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            return
+        if not chunk:
+            return
 
 
 class RouteManager:

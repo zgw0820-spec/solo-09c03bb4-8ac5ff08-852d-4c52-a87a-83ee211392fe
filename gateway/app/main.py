@@ -29,12 +29,15 @@ from .core import (
     expire_if_needed,
     keep_locked,
     load_config,
+    notify_watchdog,
     now_iso,
     rollback_locked,
 )
 
 cfg = Config(load_config())
-store = StateStore()
+# 只有「事务提交且状态确实变化」时 store 才会回调 notify_watchdog；
+# 普通查询状态不变 -> 不写盘 -> 不回调 -> 看门狗继续休眠。
+store = StateStore(on_change=notify_watchdog)
 routes = RouteManager(cfg.target, backend=cfg.route_backend)
 
 app = FastAPI(
@@ -86,10 +89,14 @@ def enrich(trial: dict) -> dict:
     return t
 
 
-def expire_current() -> None:
-    """懒回退：任何请求进来时先把已到期的试切回退掉（与看门狗同一逻辑）。"""
+def expire_current():
+    """懒回退：任何请求进来时先把已到期的试切回退掉（与看门狗同一逻辑）。
+
+    状态未到期/无进行中试切时，事务不产生写入，也不会唤醒看门狗。
+    返回被回退的试切记录（未发生回退时为 None）。
+    """
     with store.locked() as state:
-        expire_if_needed(state, routes)
+        return expire_if_needed(state, routes)
 
 
 async def tcp_probe() -> tuple[bool, str, int]:
@@ -243,7 +250,7 @@ async def confirm_trial(trial_id: str):
 @app.get("/api/trials/current", summary="查看当前进行中的试切")
 def current_trial():
     expire_current()
-    with store.locked() as state:
+    with store.read() as state:
         cur = state.get("current")
         return {"current": enrich(cur) if cur else None}
 
@@ -251,7 +258,7 @@ def current_trial():
 @app.get("/api/trials", summary="试切列表：当前试切 + 历史结果")
 def list_trials():
     expire_current()
-    with store.locked() as state:
+    with store.read() as state:
         cur = state.get("current")
         return {
             "current": enrich(cur) if cur else None,
@@ -262,7 +269,7 @@ def list_trials():
 @app.get("/api/trials/{trial_id}", summary="查询试切结果与回退原因")
 def get_trial(trial_id: str):
     expire_current()
-    with store.locked() as state:
+    with store.read() as state:
         cur = state.get("current")
         if cur and cur["trial_id"] == trial_id:
             return enrich(cur)

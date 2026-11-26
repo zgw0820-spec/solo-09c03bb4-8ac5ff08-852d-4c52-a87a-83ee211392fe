@@ -18,6 +18,7 @@ services:
     environment:
       TARGET_IP: 172.30.0.100       # 采集端地址（entrypoint 装初始主机路由用）
       PRIMARY_NEXTHOP: 172.30.0.11  # 主用下一跳
+      TSW_IO_DEBUG: "1"             # 打印每次 state.json 读/写与看门狗唤醒，供演示核对
     cap_add:
       - NET_ADMIN                   # 改路由所需的最小特权
     sysctls:
@@ -25,6 +26,8 @@ services:
       - net.ipv4.conf.default.accept_redirects=0
     ports:
       - "8080:8000"                 # Swagger: http://localhost:8080/docs
+    volumes:
+      - ./demo:/demo:ro             # 关键场景自检：docker compose exec gateway python /demo/verify_scenarios.py
     networks:
       fieldnet:
         ipv4_address: 172.30.0.10
